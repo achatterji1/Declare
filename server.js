@@ -77,7 +77,7 @@ function beginChain(room, pid, rank, allowOne) {
     if (c && c.r === rank) G.pick.push(pid + ":" + i);
   });
   addDumpPicks(G, pid);
-  G.log = "You put " + rank + " on center — discard one matching " + rank + " from hand (or dump an opponent " + rank + "), or Done. One only — not a chain.";
+  G.log = "You put " + rank + " on center — discard one matching " + rank + " from hand (or dump an opponent " + rank + "), or Pass. One only — not a chain.";
   return broadcast(room);
 }
 
@@ -160,7 +160,7 @@ function startDumpGive(room, actor, oppPid, emptiedI, rank) {
   G.pick = [];
   G.players[actor].slots.forEach((c, i) => { if (c) G.pick.push(actor + ":" + i); });
   // keep G.free (dump already set true) so next player can Pick after turn
-  G.log = "Give them a card — tap one of yours to hand over to " + G.players[oppPid].name + ".";
+  G.log = "Give them a card — drag one of yours onto the empty slot to hand over to " + G.players[oppPid].name + ".";
   return broadcast(room);
 }
 function completeDumpGive(room, giveI) {
@@ -301,6 +301,11 @@ function publicState(room, viewerId) {
     pileCount: G.pile.length,
     pileTop: top ? { r: top.r, s: top.s } : null,
     pileUnder: G.pile.length > 1 ? { r: G.pile[G.pile.length - 2].r, s: G.pile[G.pile.length - 2].s } : null,
+    // Positions only — ranks stay on the cards. Needed so drag can target the give-slot and King pair.
+    dumpGive: G.dumpGive ? { actor: G.dumpGive.actor, oppPid: G.dumpGive.oppPid, emptiedI: G.dumpGive.emptiedI } : null,
+    powerMine: viewerId === G.turn && G.powerMine ? { pid: G.powerMine.pid, i: G.powerMine.i } : null,
+    powerTarget: viewerId === G.turn && G.powerTarget ? { pid: G.powerTarget.pid, i: G.powerTarget.i } : null,
+    keepBoth: G.phase === "keepBoth" && G.keepBoth ? { pid: G.keepBoth.pid, handI: G.keepBoth.handI, placedI: G.keepBoth.placedI } : null,
     players: G.players.map((p) => ({
       id: p.id,
       name: p.name,
@@ -311,7 +316,10 @@ function publicState(room, viewerId) {
         if (!c) return null;
         const isBottomTwo = i >= G.cols && i < G.cols + 2;
         const memorizeReveal = G.phase === "memorize" && p.id === viewerId && isBottomTwo;
-        const known = G.phase === "reveal" || c.known[viewerId] || memorizeReveal;
+        // Wrong discard/dump: both cards are face up for every viewer during the brief keepBoth pause.
+        const kb = G.phase === "keepBoth" && G.keepBoth;
+        const publicFlash = !!(kb && kb.pid === p.id && (i === kb.handI || i === kb.placedI));
+        const known = G.phase === "reveal" || c.known[viewerId] || memorizeReveal || publicFlash;
         return known ? { r: c.r, s: c.s, known: true } : { known: false };
       })
     }))
@@ -460,7 +468,7 @@ function endPeekReveal(room) {
     G.powerStep = "k-trade";
     G.powerTarget = { pid: pr.targetPid, i: pr.i };
     G.pick = [];
-    G.log = "Memorize both peeks. Trade (swap those two cards) or Skip trade.";
+    G.log = "Memorize both peeks. Drag your peeked card onto theirs to trade, or Pass.";
     return broadcast(room);
   }
   G.free = false;
@@ -521,6 +529,162 @@ function swapIntoHand(G, pid, i) {
   return taken;
 }
 
+function dragDiscard(room, pid, i) {
+  const G = room.G;
+  const card = G.players[pid] && G.players[pid].slots[i];
+  const drawn = pileTop(G);
+  if (!card || !drawn || pid !== G.turn) return false;
+  if (G.phase === "chain") {
+    if (G.pick.indexOf(pid + ":" + i) < 0) return false;
+    if (card.r !== G.chainRank) return false;
+    G.players[pid].slots[i] = null;
+    G.pile.push(card);
+    G.free = true;
+    G.log = "Discarded matching " + label(card) + " after swap. Turn ends; next can Pick it.";
+    G.pick = []; G.chainPid = null; G.chainRank = null;
+    finish(room);
+    return true;
+  }
+  const allowed = G.phase === "act" || (G.phase === "draw" && G.free) || (G.phase === "pick" && G.intent === "discard");
+  if (!allowed) return false;
+  if (card.r === drawn.r) {
+    G.players[pid].slots[i] = null;
+    G.pile.push(card);
+    G.free = true;
+    G.log = "Discarded " + label(card) + " on top of " + label(drawn) + ". One match action — turn ends; next can Pick it.";
+    beginChain(room, pid, card.r);
+    return true;
+  }
+  // Wrong rank is a real move: keep both, show them, end the turn.
+  wrongDiscardKeepBoth(room, pid, i);
+  return true;
+}
+
+function dragDump(room, pid, oppPid, i) {
+  const G = room.G;
+  if (oppPid === pid || handLocked(G, oppPid)) return false;
+  if (!pileTop(G)) return false;
+  const allowed = G.phase === "act" || (G.phase === "draw" && G.free) || G.phase === "chain" || (G.phase === "pick" && G.intent === "discard");
+  if (!allowed || pid !== G.turn) return false;
+  if ((G.phase === "act" || (G.phase === "draw" && G.free)) && G.pick.indexOf(oppPid + ":" + i) < 0) {
+    addDumpPicks(G, pid);
+  }
+  return !!tryDumpOpponent(room, pid, oppPid, i);
+}
+
+function dragQueen(room, pid, myI, oppPid, oppI) {
+  const G = room.G;
+  if (G.phase !== "power" || G.power !== "Q" || pid !== G.turn) return false;
+  if (G.powerStep !== "q-mine" && G.powerStep !== "q-theirs") return false;
+  if (oppPid == null || oppI == null || oppPid === pid || handLocked(G, oppPid)) return false;
+  const mine = G.players[pid].slots[myI];
+  const theirs = G.players[oppPid].slots[oppI];
+  if (!mine || !theirs) return false;
+  G.players[pid].slots[myI] = theirs;
+  G.players[oppPid].slots[oppI] = mine;
+  G.players[pid].slots[myI].known = Array(G.n).fill(false);
+  G.players[oppPid].slots[oppI].known = Array(G.n).fill(false);
+  G.log = "Blind-traded with " + G.players[oppPid].name + ".";
+  G.free = false; G.power = null; G.powerStep = null; G.powerTarget = null; G.powerMine = null; G.pick = [];
+  finish(room);
+  return true;
+}
+
+function dragKing(room, pid, p, i, tp, ti) {
+  const G = room.G;
+  if (G.phase !== "power" || G.powerStep !== "k-trade" || pid !== G.turn) return false;
+  const mine = G.powerMine;
+  const opp = G.powerTarget;
+  if (!mine || !opp) return false;
+  const forward = p === mine.pid && i === mine.i && tp === opp.pid && ti === opp.i;
+  const back = p === opp.pid && i === opp.i && tp === mine.pid && ti === mine.i;
+  if (!forward && !back) return false;
+  return applyKingTrade(room, pid);
+}
+
+function applyKingTrade(room, pid) {
+  const G = room.G;
+  const mine = G.powerMine;
+  const opp = G.powerTarget;
+  if (!mine || !opp) return false;
+  const myCard = G.players[mine.pid].slots[mine.i];
+  const oppCard = G.players[opp.pid].slots[opp.i];
+  if (!myCard || !oppCard) {
+    G.log = "Trade failed — a peeked card is gone. K stays pickable for next.";
+    G.free = true; G.power = null; G.powerStep = null; G.powerTarget = null; G.powerMine = null; G.pick = [];
+    finish(room);
+    return true;
+  }
+  G.players[mine.pid].slots[mine.i] = oppCard;
+  G.players[opp.pid].slots[opp.i] = myCard;
+  G.players[mine.pid].slots[mine.i].known = Array(G.n).fill(false);
+  G.players[opp.pid].slots[opp.i].known = Array(G.n).fill(false);
+  G.log = G.players[pid].name + " traded after King peeks. K stays pickable for next.";
+  G.free = true; G.power = null; G.powerStep = null; G.powerTarget = null; G.powerMine = null; G.pick = [];
+  finish(room);
+  return true;
+}
+
+// Drag chooses the same move the buttons used to arm. It does not add rules.
+function handleDrag(room, pid, msg) {
+  const G = room.G;
+  if (!G || room.status !== "playing") return;
+  if (G.phase === "reveal" || G.phase === "memorize" || G.phase === "keepBoth" || G.phase === "peekReveal") return;
+  if (pid !== G.turn) return;
+
+  const gesture = msg.gesture;
+  const i = Number(msg.i);
+  const p = msg.p != null ? Number(msg.p) : pid;
+  const ti = msg.ti != null ? Number(msg.ti) : null;
+  const tp = msg.tp != null ? Number(msg.tp) : null;
+  if (!Number.isInteger(i) || i < 0) {
+    if (gesture !== "ktrade") return;
+  }
+
+  if (gesture === "swap" || gesture === "claim") {
+    if (gesture === "swap" && G.phase !== "act") return;
+    if (gesture === "claim" && !(G.phase === "draw" && G.free && pileTop(G))) return;
+    if (p !== pid) return;
+    const card = G.players[pid].slots[i];
+    const drawn = pileTop(G);
+    if (!card || !drawn) return;
+    const taken = swapIntoHand(G, pid, i);
+    const dumped = pileTop(G);
+    G.log = (gesture === "claim" ? "Picked " : "Swapped in ") + label(taken) + " — " + label(dumped) + " on center.";
+    return beginChain(room, pid, dumped.r, true);
+  }
+
+  if (gesture === "discard") {
+    if (p !== pid) return;
+    dragDiscard(room, pid, i);
+    return;
+  }
+
+  if (gesture === "dump") {
+    dragDump(room, pid, p, i);
+    return;
+  }
+
+  if (gesture === "give") {
+    if (G.phase !== "dumpGive" || !G.dumpGive || G.dumpGive.actor !== pid) return;
+    if (p !== pid) return;
+    if (G.pick.indexOf(pid + ":" + i) < 0) return;
+    return completeDumpGive(room, i);
+  }
+
+  if (gesture === "qtrade") {
+    const myI = p === pid ? i : ti;
+    const oppPid = p === pid ? tp : p;
+    const oppI = p === pid ? ti : i;
+    dragQueen(room, pid, myI, oppPid, oppI);
+    return;
+  }
+
+  if (gesture === "ktrade") {
+    dragKing(room, pid, p, i, tp, ti);
+  }
+}
+
 function handleAction(room, pid, msg) {
   const G = room.G;
   if (!G || room.status !== "playing") return;
@@ -528,6 +692,7 @@ function handleAction(room, pid, msg) {
   if (G.phase === "keepBoth" || G.phase === "peekReveal") return;
 
   const act = msg.action;
+  if (act === "drag") return handleDrag(room, pid, msg);
   if (G.phase === "dumpGive" && act !== "card") return;
 
   if (G.phase === "memorize") {
@@ -652,7 +817,7 @@ function handleAction(room, pid, msg) {
           G.free = false; G.power = null; G.powerStep = null; G.powerTarget = null; G.powerMine = null; G.pick = [];
           return finish(room);
         }
-        G.log = "Blind trade: tap an opponent card to swap with.";
+        G.log = "Blind trade: drag your card onto an opponent card.";
         return broadcast(room);
       }
       if (G.powerStep === "q-theirs") {
@@ -724,7 +889,7 @@ function handleAction(room, pid, msg) {
     G.powerTarget = null;
     G.powerMine = null;
     fillPowerPicks(G);
-    G.log = powerHint(top.r) + " Tap a highlighted card.";
+    G.log = powerHint(top.r) + (top.r === "Q" ? " Drag one of your cards onto an opponent card." : " Tap a highlighted card.");
     return broadcast(room);
   }
 
@@ -732,7 +897,7 @@ function handleAction(room, pid, msg) {
     if (G.phase !== "chain" || pid !== G.turn) return;
     G.pick = []; G.chainPid = null; G.chainRank = null;
     if (pileTop(G)) G.free = true;
-    G.log = "Done — skipped extra match after swap. Next can Pick center.";
+    G.log = "Passed — skipped extra match after swap. Next can Pick center.";
     return finish(room);
   }
 
@@ -741,32 +906,14 @@ function handleAction(room, pid, msg) {
     // After Use power on K, K stays on center pickable for next (same as Pass)
     G.free = true;
     // Peeks were temporary UI only; priorKnown already restored after each peekReveal
-    G.log = "Skipped trade. K stays pickable for next.";
+    G.log = "Passed on the trade. K stays pickable for next.";
     G.power = null; G.powerStep = null; G.powerTarget = null; G.powerMine = null; G.pick = [];
     return finish(room);
   }
 
   if (act === "confirmTrade") {
     if (G.phase !== "power" || G.powerStep !== "k-trade" || pid !== G.turn) return;
-    const mine = G.powerMine;
-    const opp = G.powerTarget;
-    if (!mine || !opp) return;
-    const myCard = G.players[mine.pid].slots[mine.i];
-    const oppCard = G.players[opp.pid].slots[opp.i];
-    if (!myCard || !oppCard) {
-      G.log = "Trade failed — a peeked card is gone. K stays pickable for next.";
-      G.free = true; G.power = null; G.powerStep = null; G.powerTarget = null; G.powerMine = null; G.pick = [];
-      return finish(room);
-    }
-    G.players[mine.pid].slots[mine.i] = oppCard;
-    G.players[opp.pid].slots[opp.i] = myCard;
-    // After trade, both slots face-down (peek knowledge does not stick as permanent known)
-    G.players[mine.pid].slots[mine.i].known = Array(G.n).fill(false);
-    G.players[opp.pid].slots[opp.i].known = Array(G.n).fill(false);
-    // Vague log — do not reveal which cards moved; K remains pickable for next
-    G.log = G.players[pid].name + " traded after King peeks. K stays pickable for next.";
-    G.free = true; G.power = null; G.powerStep = null; G.powerTarget = null; G.powerMine = null; G.pick = [];
-    return finish(room);
+    return applyKingTrade(room, pid);
   }
 
   if (act === "declare") {
@@ -871,6 +1018,18 @@ wss.on("connection", (ws) => {
   });
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log("DECLARE listening on " + PORT);
-});
+if (require.main === module) {
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log("DECLARE listening on " + PORT);
+  });
+}
+
+module.exports = {
+  makeDeal,
+  handleAction,
+  publicState,
+  endKeepBothReveal,
+  beginChain,
+  RANKS,
+  SUITS
+};
